@@ -80,7 +80,7 @@ uv run bot.py
 
 To make the agent functional we expect you to implement at least the following missing functionalities:
 
-1. **Conversation Flow**: Modify the agent's behavior to ask for patient name and date of birth, then appointment date and time. (This guide)[https://docs.pipecat.ai/guides/learn/function-calling] on function calling from Pipecat is probably a good start.
+1. **Conversation Flow**: Modify the agent's behavior to ask for patient name and date of birth, then appointment date and time. [This guide](https://docs.pipecat.ai/guides/learn/function-calling) on function calling from Pipecat is probably a good start.
 
 2. **Find Patient**: Implement `healthie.find_patient(name, date_of_birth)` in `healthie.py` to search for patients in Healthie.
 
