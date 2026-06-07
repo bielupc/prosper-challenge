@@ -10,7 +10,7 @@ from core.database import create_db
 from core.seed import seed_slots
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import appointments, dashboard, events, patients, slots
+from routers import appointments, audit, dashboard, events, patients, slots
 
 
 @asynccontextmanager
@@ -41,4 +41,5 @@ app.include_router(patients.router)
 app.include_router(slots.router)
 app.include_router(appointments.router)
 app.include_router(dashboard.router)
+app.include_router(audit.router)
 app.include_router(events.router)
