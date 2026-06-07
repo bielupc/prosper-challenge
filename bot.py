@@ -5,11 +5,14 @@
 #
 
 import os
+import uuid
 from datetime import date
 
 import httpx
 from dotenv import load_dotenv
 from loguru import logger
+
+from audit import AuditLogger, audited, record_http
 
 print("🚀 Starting Pipecat bot...")
 print("⏳ Loading models and imports (20 seconds, first run only)\n")
@@ -79,11 +82,14 @@ def _friendly_error(resp: httpx.Response) -> dict:
 async def _ehr_post(client: httpx.AsyncClient, path: str, body: dict) -> tuple[bool, dict]:
     try:
         resp = await client.post(path, json=body)
-    except httpx.RequestError:
+    except httpx.RequestError as e:
         logger.exception("EHR POST %s failed", path)
+        record_http("POST", path, body, None, None, error=str(e))
         return False, {"detail": "Could not reach the scheduling system. Please try again."}
+    payload = resp.json() if resp.content else None
+    record_http("POST", path, body, resp.status_code, payload)
     if resp.is_success:
-        return True, resp.json()
+        return True, payload
     logger.warning("EHR POST %s -> %s: %s", path, resp.status_code, resp.text)
     return False, _friendly_error(resp)
 
@@ -91,11 +97,14 @@ async def _ehr_post(client: httpx.AsyncClient, path: str, body: dict) -> tuple[b
 async def _ehr_get(client: httpx.AsyncClient, path: str, params: dict) -> tuple[bool, dict | list]:
     try:
         resp = await client.get(path, params=params)
-    except httpx.RequestError:
+    except httpx.RequestError as e:
         logger.exception("EHR GET %s failed", path)
+        record_http("GET", path, params, None, None, error=str(e))
         return False, {"detail": "Could not reach the scheduling system. Please try again."}
+    payload = resp.json() if resp.content else None
+    record_http("GET", path, params, resp.status_code, payload)
     if resp.is_success:
-        return True, resp.json()
+        return True, payload
     logger.warning("EHR GET %s -> %s: %s", path, resp.status_code, resp.text)
     return False, _friendly_error(resp)
 
@@ -377,13 +386,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         llms=[llm, fallback_llm],
         strategy_type=ServiceSwitcherStrategyManual,
     )
-    # Register tools on the switcher so the handler is registered on BOTH LLMs.
-    llm_switcher.register_function("find_patient", tool_find_patient)
-    llm_switcher.register_function("create_patient", tool_create_patient)
-    llm_switcher.register_function("list_availability_slots", tool_list_availability_slots)
-    llm_switcher.register_function("list_appointments", tool_list_appointments)
-    llm_switcher.register_function("create_appointment", tool_create_appointment)
-    llm_switcher.register_function("cancel_appointment", tool_cancel_appointment)
 
     today = date.today().strftime("%A, %B %d, %Y")
     messages = [
@@ -445,6 +447,26 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     ]
 
     context = LLMContext(messages, tools=ToolsSchema(standard_tools=_TOOL_SCHEMAS))
+
+    def _transcript() -> list:
+        getter = getattr(context, "get_messages", None)
+        return getter() if callable(getter) else list(context.messages)
+
+    audit = AuditLogger(client, session_id, session, _transcript)
+
+    # Wrap each handler so every call is persisted, then register on the switcher
+    # (which forwards registration to BOTH the primary and fallback LLMs).
+    _handlers = {
+        "find_patient": tool_find_patient,
+        "create_patient": tool_create_patient,
+        "list_availability_slots": tool_list_availability_slots,
+        "list_appointments": tool_list_appointments,
+        "create_appointment": tool_create_appointment,
+        "cancel_appointment": tool_cancel_appointment,
+    }
+    for _name, _handler in _handlers.items():
+        llm_switcher.register_function(_name, audited(audit, _name, _handler))
+
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
