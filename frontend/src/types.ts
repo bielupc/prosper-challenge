@@ -14,6 +14,7 @@ export interface CalendarSlot {
   start_time: string
   end_time: string
   is_booked: boolean
+  appointment_id: string | null
   patient_name: string | null
 }
 

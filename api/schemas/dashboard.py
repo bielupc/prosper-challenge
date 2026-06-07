@@ -13,6 +13,7 @@ class CalendarSlot(BaseModel):
     start_time: time
     end_time: time
     is_booked: bool
+    appointment_id: Optional[uuid.UUID] = None
     patient_name: Optional[str] = None
 
 

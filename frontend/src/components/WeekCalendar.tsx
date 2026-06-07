@@ -1,3 +1,4 @@
+import { Fragment } from 'react'
 import type { CalendarSlot } from '../types'
 import { addDays, toISODate, formatTime } from '../utils'
 
@@ -9,7 +10,6 @@ interface Props {
   onToday: () => void
 }
 
-// Clinic hours: 09:00–17:00 in 30-min blocks (matches the seeded slots)
 const ROW_TIMES = Array.from({ length: 16 }, (_, i) => {
   const minutes = 9 * 60 + i * 30
   const h = String(Math.floor(minutes / 60)).padStart(2, '0')
@@ -18,6 +18,56 @@ const ROW_TIMES = Array.from({ length: 16 }, (_, i) => {
 })
 
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']
+
+// One rendered cell per day column. Consecutive booked slots for the same patient
+// collapse into a single 'booked' cell that spans `span` rows; the slots it covers
+// become 'covered' and are not rendered.
+type DayCell =
+  | { kind: 'empty'; ti: number }
+  | { kind: 'available'; ti: number }
+  | { kind: 'covered'; ti: number }
+  | { kind: 'booked'; ti: number; span: number; name: string; start: string; end: string }
+
+function buildDay(iso: string, byKey: Map<string, CalendarSlot>): DayCell[] {
+  const cells: DayCell[] = []
+  let ti = 0
+  while (ti < ROW_TIMES.length) {
+    const slot = byKey.get(`${iso}_${ROW_TIMES[ti]}`)
+    if (!slot) {
+      cells.push({ kind: 'empty', ti })
+      ti++
+      continue
+    }
+    if (!slot.is_booked) {
+      cells.push({ kind: 'available', ti })
+      ti++
+      continue
+    }
+    // Booked. Merge forward while the next contiguous slot belongs to the same appointment.
+    const apptId = slot.appointment_id
+    const name = slot.patient_name
+    let span = 1
+    if (apptId) {
+      while (ti + span < ROW_TIMES.length) {
+        const next = byKey.get(`${iso}_${ROW_TIMES[ti + span]}`)
+        if (next && next.is_booked && next.appointment_id === apptId) span++
+        else break
+      }
+    }
+    const last = byKey.get(`${iso}_${ROW_TIMES[ti + span - 1]}`)!
+    cells.push({
+      kind: 'booked',
+      ti,
+      span,
+      name: name ?? 'Booked',
+      start: ROW_TIMES[ti],
+      end: last.end_time,
+    })
+    for (let k = 1; k < span; k++) cells.push({ kind: 'covered', ti: ti + k })
+    ti += span
+  }
+  return cells
+}
 
 export default function WeekCalendar({ weekStart, slots, onPrev, onNext, onToday }: Props) {
   const days = DAY_LABELS.map((label, i) => {
@@ -64,12 +114,16 @@ export default function WeekCalendar({ weekStart, slots, onPrev, onNext, onToday
       </div>
 
       <div className="overflow-x-auto">
-        <div className="grid grid-cols-[64px_repeat(5,minmax(120px,1fr))] min-w-[680px]">
-          {/* Header row */}
-          <div />
-          {days.map(d => (
+        <div
+          className="grid grid-cols-[64px_repeat(5,minmax(120px,1fr))] min-w-[680px]"
+          style={{ gridTemplateRows: `auto repeat(${ROW_TIMES.length}, 3rem)` }}
+        >
+          {/* Header corner */}
+          <div style={{ gridColumn: 1, gridRow: 1 }} />
+          {days.map((d, di) => (
             <div
               key={d.iso}
+              style={{ gridColumn: di + 2, gridRow: 1 }}
               className={`pb-2 text-center border-b border-border-gray ${
                 d.iso === todayIso ? 'text-prosper-orange' : 'text-warm-600'
               }`}
@@ -81,9 +135,24 @@ export default function WeekCalendar({ weekStart, slots, onPrev, onNext, onToday
             </div>
           ))}
 
-          {/* Time rows */}
-          {ROW_TIMES.map(t => (
-            <Row key={t} time={t} days={days} byKey={byKey} />
+          {/* Time labels */}
+          {ROW_TIMES.map((t, ti) => (
+            <div
+              key={t}
+              style={{ gridColumn: 1, gridRow: ti + 2 }}
+              className="pr-2 -mt-2 text-right font-manrope text-xs text-warm-500"
+            >
+              {formatTime(t)}
+            </div>
+          ))}
+
+          {/* Day cells */}
+          {days.map((d, di) => (
+            <Fragment key={d.iso}>
+              {buildDay(d.iso, byKey).map(cell => (
+                <DayCellView key={cell.ti} cell={cell} col={di + 2} />
+              ))}
+            </Fragment>
           ))}
         </div>
       </div>
@@ -93,45 +162,31 @@ export default function WeekCalendar({ weekStart, slots, onPrev, onNext, onToday
   )
 }
 
-function Row({
-  time,
-  days,
-  byKey,
-}: {
-  time: string
-  days: { iso: string }[]
-  byKey: Map<string, CalendarSlot>
-}) {
-  return (
-    <>
-      <div className="h-12 pr-2 -mt-2 text-right font-manrope text-xs text-warm-500">
-        {formatTime(time)}
-      </div>
-      {days.map(d => {
-        const slot = byKey.get(`${d.iso}_${time}`)
-        return <Cell key={`${d.iso}_${time}`} slot={slot} />
-      })}
-    </>
-  )
-}
+function DayCellView({ cell, col }: { cell: DayCell; col: number }) {
+  if (cell.kind === 'covered') return null
 
-function Cell({ slot }: { slot?: CalendarSlot }) {
-  if (!slot) {
+  const gridRow = cell.kind === 'booked' ? `${cell.ti + 2} / span ${cell.span}` : cell.ti + 2
+  const style = { gridColumn: col, gridRow }
+
+  if (cell.kind === 'empty') {
     // No slot exists for this block (outside clinic hours / not seeded)
-    return <div className="h-12 border-b border-r border-border-gray bg-cream/40" />
+    return <div style={style} className="border-b border-r border-border-gray bg-cream/40" />
   }
-  if (slot.is_booked) {
-    return (
-      <div className="h-12 border-b border-r border-border-gray p-0.5">
-        <div className="h-full rounded-md bg-prosper-orange/10 border-l-2 border-prosper-orange px-1.5 py-0.5 overflow-hidden">
-          <p className="font-manrope font-medium text-[11px] leading-tight text-prosper-orange truncate">
-            {slot.patient_name ?? 'Booked'}
-          </p>
-        </div>
+  if (cell.kind === 'available') {
+    return <div style={style} className="border-b border-r border-border-gray bg-white" />
+  }
+  return (
+    <div style={style} className="border-b border-r border-border-gray p-0.5">
+      <div className="h-full rounded-md bg-prosper-orange/10 border-l-2 border-prosper-orange px-1.5 py-1 overflow-hidden">
+        <p className="font-manrope font-medium text-[11px] leading-tight text-prosper-orange truncate">
+          {cell.name}
+        </p>
+        <p className="font-manrope text-[10px] leading-tight text-prosper-orange/70">
+          {formatTime(cell.start)}–{formatTime(cell.end)}
+        </p>
       </div>
-    )
-  }
-  return <div className="h-12 border-b border-r border-border-gray bg-white" />
+    </div>
+  )
 }
 
 function Legend() {

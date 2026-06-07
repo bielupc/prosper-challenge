@@ -11,7 +11,7 @@ from models.base import _tz_column, _utcnow
 class Patient(SQLModel, table=True):
     __tablename__ = "patients"
     __table_args__ = (
-        # Case-insensitive identity uniqueness — matches the lowercased find_patient lookup
+        # Case-insensitive identity uniqueness
         Index(
             "uq_patient_identity",
             func.lower(text("first_name")),
