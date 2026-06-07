@@ -3,20 +3,24 @@ import Header from './components/Header'
 import StatsBar from './components/StatsBar'
 import PatientsTable from './components/PatientsTable'
 import WeekCalendar from './components/WeekCalendar'
+import AuditLog from './components/AuditLog'
 import Tabs from './components/Tabs'
 import type { DashboardData, CalendarSlot } from './types'
 import { mondayOf, toISODate, addDays } from './utils'
+import { API_URL, headers } from './api'
 
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
-const API_KEY = import.meta.env.VITE_API_KEY ?? ''
-const headers = { 'X-API-Key': API_KEY }
+type Tab = 'appointments' | 'patients' | 'audit'
 
-type Tab = 'appointments' | 'patients'
+function initialWeek(): Date {
+  const today = new Date()
+  const dow = today.getDay() // 0 = Sun, 6 = Sat
+  return dow === 0 || dow === 6 ? mondayOf(addDays(today, 7)) : mondayOf(today)
+}
 
 export default function App() {
   const [data, setData] = useState<DashboardData | null>(null)
   const [slots, setSlots] = useState<CalendarSlot[]>([])
-  const [weekStart, setWeekStart] = useState(() => mondayOf(new Date()))
+  const [weekStart, setWeekStart] = useState(initialWeek)
   const [tab, setTab] = useState<Tab>('appointments')
 
   const fetchDashboard = useCallback(() => {
@@ -77,6 +81,7 @@ export default function App() {
             tabs={[
               { id: 'appointments', label: 'Appointments' },
               { id: 'patients', label: 'Patients', count: data?.total_patients },
+              { id: 'audit', label: 'Audit Log' },
             ]}
             active={tab}
             onChange={id => setTab(id as Tab)}
@@ -90,8 +95,10 @@ export default function App() {
               onNext={() => setWeekStart(w => addDays(w, 7))}
               onToday={() => setWeekStart(mondayOf(new Date()))}
             />
-          ) : (
+          ) : tab === 'patients' ? (
             <PatientsTable patients={data?.recent_patients ?? []} />
+          ) : (
+            <AuditLog />
           )}
         </div>
       </main>
