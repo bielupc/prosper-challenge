@@ -13,7 +13,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 router = APIRouter()
 
 
-@router.post("/create_patient", response_model=PatientResponse)
+@router.post("/create_patient", response_model=PatientResponse, status_code=201)
 async def create_patient(body: CreatePatientRequest, session: AsyncSession = Depends(get_session)):
     patient = Patient(**body.model_dump())
     session.add(patient)

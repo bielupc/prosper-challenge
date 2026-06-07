@@ -8,4 +8,5 @@ dependencies = [
     "asyncpg>=0.30",
     "uvicorn[standard]>=0.34",
     "python-dotenv>=1.0",
+    "email-validator>=2.0",
 ]

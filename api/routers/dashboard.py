@@ -3,7 +3,7 @@ from typing import List
 
 from core.database import get_session
 from fastapi import APIRouter, Depends
-from models import Appointment, AvailabilitySlot, Patient
+from models import Appointment, AppointmentSlot, AvailabilitySlot, Patient
 from schemas import CalendarSlot, DashboardResponse, PatientResponse
 from sqlalchemy import func
 from sqlalchemy import select as sa_select
@@ -20,9 +20,14 @@ async def dashboard(session: AsyncSession = Depends(get_session)):
 
     booked_today = (
         await session.execute(
-            sa_select(func.count(Appointment.id))
-            .join(AvailabilitySlot, Appointment.slot_id == AvailabilitySlot.id)
-            .where(AvailabilitySlot.date == today, Appointment.status == "scheduled")
+            sa_select(func.count(func.distinct(Appointment.id)))
+            .join(AppointmentSlot, AppointmentSlot.appointment_id == Appointment.id)
+            .join(AvailabilitySlot, AvailabilitySlot.id == AppointmentSlot.slot_id)
+            .where(
+                AvailabilitySlot.date == today,
+                Appointment.status == "scheduled",
+                AppointmentSlot.active == True, 
+            )
         )
     ).scalar_one()
 
@@ -61,11 +66,17 @@ async def calendar(start: date, session: AsyncSession = Depends(get_session)):
                     AvailabilitySlot.start_time,
                     AvailabilitySlot.end_time,
                     AvailabilitySlot.is_booked,
+                    Appointment.id.label("appointment_id"),
                     (Patient.first_name + " " + Patient.last_name).label("patient_name"),
                 )
                 .outerjoin(
+                    AppointmentSlot,
+                    (AppointmentSlot.slot_id == AvailabilitySlot.id)
+                    & (AppointmentSlot.active == True), 
+                )
+                .outerjoin(
                     Appointment,
-                    (Appointment.slot_id == AvailabilitySlot.id)
+                    (Appointment.id == AppointmentSlot.appointment_id)
                     & (Appointment.status == "scheduled"),
                 )
                 .outerjoin(Patient, Patient.id == Appointment.patient_id)

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import models
+import models  # noqa: F401 — registers SQLModel metadata
 from core.auth import api_key_middleware
 from core.database import create_db
 from core.seed import seed_slots
@@ -31,9 +31,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "ok"}
+
 
 app.include_router(patients.router)
 app.include_router(slots.router)
