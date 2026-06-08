@@ -7,7 +7,7 @@ from loguru import logger
 try:
     from audit import record_http
 except ImportError:
-    def record_http(*args, **kwargs):  # noqa: E302
+    def record_http(*args, **kwargs):
         pass
 
 _EHR_BASE = os.environ.get("EHR_API_BASE_URL")

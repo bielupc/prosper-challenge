@@ -1,12 +1,5 @@
-#
-# Audit logging for the voice agent's tool calls and conversation.
-#
-# Tool handlers are wrapped by `audited(...)`, which records the LLM arguments,
-# the EHR API exchange (captured via the `_http_exchange` context var that
-# `record_http` writes into), and the result handed back to the LLM. Everything
-# is shipped to the EHR API over the bot's existing authenticated httpx client.
-# Audit failures are swallowed — they must never break a live call.
-#
+""" Audit logging for the voice agent's tool calls and conversation."""
+
 import asyncio
 import contextvars
 import json
@@ -16,25 +9,19 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 from loguru import logger
 
-# Background audit tasks kept alive until done (create_task doesn't hold a strong
-# ref). Audit POSTs run off the conversation's critical path — see flows_audited.
 _background_tasks: set[asyncio.Task] = set()
 
 
 def _spawn(coro: Awaitable[None]) -> None:
-    task = asyncio.create_task(coro)  # type: ignore[arg-type]
+    task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
 
 async def flush_pending() -> None:
-    """Await any in-flight background audit tasks (call before final flush/shutdown)."""
     if _background_tasks:
         await asyncio.gather(*list(_background_tasks), return_exceptions=True)
 
-
-# Holds the in-flight tool call's HTTP exchange. Set by `audited`, written by
-# `record_http` (called from inside _ehr_get/_ehr_post), read back when logging.
 _http_exchange: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "http_exchange", default=None
 )
@@ -63,7 +50,6 @@ def record_http(
 
 
 def _safe(obj: Any) -> Any:
-    """Coerce to JSON-serializable, tolerating uuids/dates/sets in tool payloads."""
     try:
         return json.loads(json.dumps(obj, default=str))
     except (TypeError, ValueError):
@@ -82,6 +68,7 @@ class AuditLogger:
         self._session_id = str(session_id)
         self._state = session_state
         self._get_transcript = get_transcript
+        self._finished = False
 
     async def _post(self, path: str, body: dict) -> None:
         try:
@@ -104,8 +91,9 @@ class AuditLogger:
         )
 
     async def finish(self) -> None:
-        # Let any background tool-call logs land before the final session flush,
-        # and before run_bot closes the shared httpx client.
+        if self._finished:
+            return
+        self._finished = True
         await flush_pending()
         await self._post(
             "/audit/session",
@@ -129,8 +117,6 @@ class AuditLogger:
         http = http or {}
         status = http.get("response_status")
         error = http.get("error")
-        # Failure = an HTTP error reached us, or the request raised. Short-circuit
-        # handlers that never hit the API (no status, no error) count as success.
         success = error is None and (status is None or status < 400)
         await self._post(
             "/audit/tool_call",
@@ -154,12 +140,7 @@ class AuditLogger:
 
 
 def flows_audited(tool_name: str, handler: Callable) -> Callable:
-    """Wrap a Pipecat Flows handler (args, fm) for audit logging.
-
-    Reads AuditLogger from fm.state['audit'] lazily — safe to call before
-    the logger is attached to state.
-    """
-
+    """Wrap a Pipecat Flows handler (args, fm) for audit logging."""
     async def wrapped(args: Any, fm: Any):
         audit: Optional[AuditLogger] = fm.state.get("audit")
         token = _http_exchange.set({})
@@ -172,9 +153,7 @@ def flows_audited(tool_name: str, handler: Callable) -> Callable:
             http = _http_exchange.get()
             _http_exchange.reset(token)
             if audit:
-                # Fire-and-forget: audit POSTs must NOT block the handler's return,
-                # which drives the node transition and the next LLM turn. Snapshot
-                # everything the coroutine needs, then dispatch in the background.
+                # Fire-and-forget: audit POSTs must NOT block the handler's return.
                 duration_ms = int((time.monotonic() - start) * 1000)
                 result_snapshot = result[0] if isinstance(result, tuple) else result
 
@@ -187,51 +166,9 @@ def flows_audited(tool_name: str, handler: Callable) -> Callable:
                             result=result_snapshot,
                             duration_ms=duration_ms,
                         )
-                        await audit.sync_transcript()
                     except Exception:
                         logger.exception("Audit logging for {} failed", tool_name)
 
                 _spawn(_emit())
-
-    return wrapped
-
-
-def audited(
-    audit: AuditLogger,
-    tool_name: str,
-    handler: Callable[[Any], Awaitable[None]],
-) -> Callable[[Any], Awaitable[None]]:
-    """Wrap a Pipecat tool handler so each invocation is persisted to the audit log."""
-
-    async def wrapped(params: Any) -> None:
-        token = _http_exchange.set({})
-        start = time.monotonic()
-        captured: dict = {}
-
-        original_cb = params.result_callback
-
-        async def capturing_cb(result, *a, **k):
-            captured["result"] = result
-            return await original_cb(result, *a, **k)
-
-        params.result_callback = capturing_cb
-        try:
-            await handler(params)
-        finally:
-            params.result_callback = original_cb
-            http = _http_exchange.get()
-            _http_exchange.reset(token)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            try:
-                await audit.log_tool_call(
-                    tool_name=tool_name,
-                    arguments=getattr(params, "arguments", None),
-                    http=http,
-                    result=captured.get("result"),
-                    duration_ms=duration_ms,
-                )
-                await audit.sync_transcript()
-            except Exception:
-                logger.exception("Audit logging for {} failed", tool_name)
 
     return wrapped
