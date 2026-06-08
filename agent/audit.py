@@ -7,6 +7,7 @@
 # is shipped to the EHR API over the bot's existing authenticated httpx client.
 # Audit failures are swallowed — they must never break a live call.
 #
+import asyncio
 import contextvars
 import json
 import time
@@ -14,6 +15,23 @@ from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 from loguru import logger
+
+# Background audit tasks kept alive until done (create_task doesn't hold a strong
+# ref). Audit POSTs run off the conversation's critical path — see flows_audited.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro: Awaitable[None]) -> None:
+    task = asyncio.create_task(coro)  # type: ignore[arg-type]
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def flush_pending() -> None:
+    """Await any in-flight background audit tasks (call before final flush/shutdown)."""
+    if _background_tasks:
+        await asyncio.gather(*list(_background_tasks), return_exceptions=True)
+
 
 # Holds the in-flight tool call's HTTP exchange. Set by `audited`, written by
 # `record_http` (called from inside _ehr_get/_ehr_post), read back when logging.
@@ -86,6 +104,9 @@ class AuditLogger:
         )
 
     async def finish(self) -> None:
+        # Let any background tool-call logs land before the final session flush,
+        # and before run_bot closes the shared httpx client.
+        await flush_pending()
         await self._post(
             "/audit/session",
             {
@@ -130,6 +151,49 @@ class AuditLogger:
                 "duration_ms": duration_ms,
             },
         )
+
+
+def flows_audited(tool_name: str, handler: Callable) -> Callable:
+    """Wrap a Pipecat Flows handler (args, fm) for audit logging.
+
+    Reads AuditLogger from fm.state['audit'] lazily — safe to call before
+    the logger is attached to state.
+    """
+
+    async def wrapped(args: Any, fm: Any):
+        audit: Optional[AuditLogger] = fm.state.get("audit")
+        token = _http_exchange.set({})
+        start = time.monotonic()
+        result = None
+        try:
+            result = await handler(args, fm)
+            return result
+        finally:
+            http = _http_exchange.get()
+            _http_exchange.reset(token)
+            if audit:
+                # Fire-and-forget: audit POSTs must NOT block the handler's return,
+                # which drives the node transition and the next LLM turn. Snapshot
+                # everything the coroutine needs, then dispatch in the background.
+                duration_ms = int((time.monotonic() - start) * 1000)
+                result_snapshot = result[0] if isinstance(result, tuple) else result
+
+                async def _emit() -> None:
+                    try:
+                        await audit.log_tool_call(
+                            tool_name=tool_name,
+                            arguments=args,
+                            http=http,
+                            result=result_snapshot,
+                            duration_ms=duration_ms,
+                        )
+                        await audit.sync_transcript()
+                    except Exception:
+                        logger.exception("Audit logging for {} failed", tool_name)
+
+                _spawn(_emit())
+
+    return wrapped
 
 
 def audited(

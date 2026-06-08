@@ -19,7 +19,7 @@ docker compose up --build
 
 # Bot only (without Docker)
 uv sync
-uv run bot.py
+uv run agent/bot.py
 
 # API type checking / linting
 cd api && uv run pyright

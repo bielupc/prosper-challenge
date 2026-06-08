@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pipecat-ai[webrtc,daily,silero,elevenlabs,openai,anthropic,local-smart-turn-v3,runner]",
     "pipecat-ai-cli",
+    "pipecat-ai-flows>=0.0.23",
 ]
 
 [dependency-groups]
