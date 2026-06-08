@@ -1,489 +1,388 @@
-# Solution Overview — Prosper Health Voice Agent
+# Solution Overview
 
-> **Challenge:** Build an EHR HTTP API and wire a Pipecat-based voice agent so it can identify patients, register new ones, and schedule or cancel appointments during a live conversation.
->
-> **Stack:** FastAPI + SQLModel + PostgreSQL (EHR), Pipecat + Pipecat Flows + OpenAI + ElevenLabs (voice agent), Vite + React + Tailwind (dashboard).
+## Index
+
+- [Solution Overview](#solution-overview)
+  - [Index](#index)
+  - [Overview](#overview)
+  - [Stack and architecture](#stack-and-architecture)
+  - [File structure](#file-structure)
+  - [How to run](#how-to-run)
+  - [Schemas](#schemas)
+  - [Tools and handlers](#tools-and-handlers)
+  - [Conversation Flow](#conversation-flow)
+  - [FlowManager vs Monolithic Prompt](#flowmanager-vs-monolithic-prompt)
+  - [Model selection](#model-selection)
+  - [Reliability](#reliability)
+    - [Guards](#guards)
+  - [Evaluation](#evaluation)
+    - [Log and audit](#log-and-audit)
+    - [Simulation Framework](#simulation-framework)
+    - [Random evaluation ideas](#random-evaluation-ideas)
+  - [Approach](#approach)
+    - [Initial plan](#initial-plan)
+    - [How it actually went](#how-it-actually-went)
 
 ---
 
-## 1. What I Was Asked to Build
+## Overview
+My solutions for the challenge serves a FastAPI backend with the asked endpoints to:
+- Create and search patients
+- Look up patients 
+- List available slots 
+- Create/cancel appointments.
 
-Per the challenge instructions, I needed to deliver three things:
+The data is persisted in a PostgreSQL database and a simple Vite frontend shows realtime appointment creations/cancellations and the registered patients list via SSE.
 
-1. **EHR HTTP API** — at minimum: `create_patient`, `find_patient`, `list_availability_slots`, `create_appointment`, `cancel_appointment`. The API must persist data in a database (not in-memory) and survive restarts.
-2. **Conversation Flow** — the agent must identify whether the caller is new or existing, register them if new, and handle booking or cancellation requests.
-3. **Integration** — the voice agent must actually call the EHR endpoints during the conversation, not just describe them.
+As asked, the agent has a set of tools wired to make use of the backend and drive the conversation flow using Pipecat's Flow Manager.
 
-I went a step further and added:
-- **Pipecat Flows** — a node-based conversation graph instead of a single monolithic prompt, giving precise control over each step.
-- A real-time dashboard (`/dashboard` + `/calendar`) for clinic staff visibility.
-- A complete audit trail (`/audit/sessions`, `/audit/tool_call`) so every tool call and conversation transcript is persisted.
-- SSE live updates (`/events`) so the dashboard refreshes instantly when a patient books or cancels.
-- An LLM fallback (OpenAI → Anthropic) so a single provider outage does not drop the call.
-- A three-layer security model that ensures `create_appointment` and `cancel_appointment` can never be triggered by the LLM directly — only after explicit patient confirmation.
+Additionally, I have incorporated the following helper endpoints and features:
+- List appointments for a given patient
+- Serve aggregated data for the dashboard
+- Log transcripts and tool executions per call for audit
+- Simulate automatic conversations evaluated by DB assertions and an LLM-as-a-judge.
+- Fallback providers for robustness.
+
+![Appointments Dashboard](images/Appointments.png)
+*Weekly calendar view with live stats and booked slots.*
+
+![Patients Dashboard](images/Patients.png)
+*Registered patients list with contact details.*
 
 ---
 
-## 2. Architecture
+## Stack and architecture
 
-### 2.1 Full-Stack Overview
+| Layer | Technology | Reason |
+|---|---|---|
+| **Flow** | `pipecat_flows` (`FlowManager`) | Explicit node graph instead of using a single fat system prompt  + tool scoping and state/memory management |
+| **Build** | Docker Compose | Clean and easy build with one-command: PostgreSQL + API + Frontend + Bot services |
+| **EHR API** | FastAPI + SQLModel + PostgreSQL (async) | Type-safe ORM, native async, familiarity |
+| **Frontend** | Vite + React + Tailwind | Fast HMR, design-system from `DESIGN.md` |
+| **Simulation** | Custom `TextTransport` + WebSocket + "patient" LLM | Runs the real bot without STT/TTS; deterministic, fast, repeatable |
+| **Audit** | Non-blocking HTTP POSTs to `/audit/*` | Traces every tool call, request/response, and transcript per session |
 
-```mermaid
-flowchart TB
-    subgraph Caller["Caller"]
-        Browser["Browser (WebRTC)"]
-    end
-
-    subgraph Voice["Voice Agent (agent/)"]
-        Transport["Daily WebRTC Transport"]
-        STT["ElevenLabs STT"]
-        TTS["ElevenLabs TTS"]
-        VAD["Silero VAD"]
-        Turn["LocalSmartTurnAnalyzerV3"]
-        LLM["OpenAI LLM (primary)"]
-        Fallback["Anthropic LLM (fallback)"]
-        RTVI["RTVI Protocol"]
-        Flows["Flow Manager\n(node graph)"]
-    end
-
-    subgraph EHR["EHR API (api/)"]
-        Auth["API Key Middleware"]
-        Patients["/create_patient\n/find_patient"]
-        Slots["/list_availability_slots"]
-        Appts["/create_appointment\n/cancel_appointment\n/list_appointments"]
-        Dash["/dashboard\n/calendar\n/events"]
-        Audit["/audit/*"]
-    end
-
-    subgraph DB[(PostgreSQL)]
-        P[(patients)]
-        S[(availability_slots)]
-        A[(appointments)]
-        AS[(appointment_slots)]
-        CS[(call_sessions)]
-        TCL[(tool_call_logs)]
-    end
-
-    subgraph Frontend["Dashboard (Vite + React)"]
-        UI["Stats + Calendar View"]
-    end
-
-    Browser <-->|WebRTC| Transport
-    Transport --> STT --> LLM --> TTS --> Transport
-    LLM -.->|ErrorFrame| Fallback
-    Flows -->|node transitions| LLM
-    LLM -->|tool calls| EHR
-    EHR --> DB
-    Frontend -->|Poll + SSE| EHR
-```
-
-### 2.2 Voice Pipeline
+**Live call** — a caller talks to the Pipecat bot, which drives the EHR API through tools while the dashboard watches via SSE:
 
 ```mermaid
 flowchart LR
-    A["WebRTC Input"] --> B["RTVIProcessor"]
-    B --> C["ElevenLabs STT"]
-    C --> D["User Aggregator\n+ Smart Turn"]
-    D --> E["LLM Switcher\n(OpenAI → Anthropic)"]
-    E --> F["ElevenLabs TTS"]
-    F --> G["WebRTC Output"]
-    G --> H["Assistant Aggregator"]
-    H --> D
+    Caller(["👤 Caller"])
 
-    E -->|FunctionCallResultFrame| I["Flow Manager\n(Node Graph)"]
-    I -->|queues LLMRunFrame| E
-    I -->|httpx| J["EHR API"]
-    I -->|audit| K["AuditLogger"]
+    subgraph Pipecat["Pipecat Bot"]
+        direction TB
+        STT["STT"] --> LLM["LLM Switcher<br/>OpenAI → Anthropic fallback"] --> TTS["TTS"]
+        FM["FlowManager<br/>nodes · tools · state"] -. drives .-> LLM
+    end
+
+    subgraph Backend["Backend"]
+        direction TB
+        EHR["EHR API<br/>FastAPI"] --> DB[("PostgreSQL")]
+    end
+
+    Dashboard(["📊 Dashboard<br/>React"])
+
+    Caller -->|audio in| STT
+    TTS -->|audio out| Caller
+    FM -->|"tool calls"| EHR
+    FM -.->|"audit POST /audit/*"| EHR
+    EHR -->|"SSE /events"| Dashboard
 ```
 
-The pipeline is a standard Pipecat linear chain. What makes it a "voice agent" rather than a chatbot is the **Flow Manager** (`pipecat_flows.FlowManager`) sitting above the LLM. It does not replace the pipeline — it drives it by:
-1. Updating the `LLMContext` task messages when entering a new node
-2. Registering only the functions relevant to that node on the LLM switcher
-3. Queuing `LLMRunFrame` to trigger inference
-4. Handling `FunctionCallResultFrame` to decide the next node transition
+**Simulation** — the same bot runs with a `TextTransport` swapped in for STT/TTS, an LLM plays the patient over a WebSocket, and the result is graded by DB assertions plus an LLM judge:
 
-### 2.3 Flow Manager Node Graph
+```mermaid
+flowchart LR
+    Patient["🤖 LLM Patient"]
 
-The conversation is modeled as a directed graph of nodes. Each node is a `NodeConfig` containing:
-- `task_messages` — a scoped system prompt for that conversational step
-- `functions` — only the tools the LLM may call in this state
-- `post_actions` — what to do after the node completes (e.g., `end_conversation`)
+    subgraph Pipecat["Same Pipecat Bot"]
+        direction TB
+        TT["TextTransport<br/>(no STT/TTS)"] <--> LLM["LLM Switcher + FlowManager"]
+    end
+
+    LLM -->|"tool calls"| EHR["EHR API"] --> DB[("PostgreSQL")]
+    Patient <-->|"text / WebSocket"| TT
+    Engine["Simulation Engine"] -->|"runs scenario"| Patient
+    Engine -->|"DB assertions"| DB
+    Engine -->|"transcript"| Judge["⚖️ LLM Judge"]
+```
+
+---
+
+## File structure
+
+```
+agent/
+  bot.py           # Voice & text entrypoints, pipeline assembly, fallback observer
+  nodes.py         # Flow node definitions (identity, intent, booking, cancellation, escalation)
+  ehr.py           # Shared http client + error wrapping
+  audit.py         # Audit wrapper for tracing
+  transport.py     # Custom TextTransport for simulation (no STT/TTS)
+  ws_server.py     # WebSocket server that drives text-mode bot for simulations
+
+api/
+  main.py          # FastAPI app, DB init, CORS, auth middleware
+  models/          # SQLModel tables and DB schemas
+  routers/         # Endpoints
+  schemas/         # Request and responses, field validations
+  core/            # Database, auth, seed, events broadcast, simulation engine, scenarios definition
+
+frontend/
+  src/App.tsx      # Tabs
+  src/components/  # WeekCalendar, PatientsTable, AuditLog, SimulationTab, SimulationResult
+```
+
+---
+
+## How to run
+
+The project is fully dockerized, simply fill the .env variables and compose up from the source of the directory.
+
+```bash
+# Full stack (PostgreSQL + API + Frontend + Bot services)
+docker compose up --build
+
+# Endpoints
+# http://localhost:8000/docs   — EHR OpenAPI
+# http://localhost:5173        — Dashboard
+# http://localhost:7860        — Voice bot
+# ws://localhost:7861          — Simulation WebSocket
+```
+
+Environment (`.env`):
+```ini
+# Providers
+ELEVENLABS_API_KEY=
+OPENAI_API_KEY=
+# Fallback LLM
+ANTHROPIC_API_KEY=
+
+# Frontend keys
+VITE_API_URL=http://localhost:8000
+VITE_API_KEY=api-key
+
+# Backend
+EHR_API_KEY=api-key
+EHR_API_BASE_URL=http://prosper-api:8000
+CLINIC_START_HOUR=9
+CLINIC_END_HOUR=17
+SLOT_MINUTES=30
+DAYS_AHEAD=365
+
+# Simulation
+BOT_WS_URL=ws://bot:7861
+SIMULATION_WS_PORT=7861
+
+#Database
+POSTGRES_USER=prosper
+POSTGRES_PASSWORD=prosper
+POSTGRES_DB=prosper
+DATABASE_URL=postgresql+asyncpg://prosper:prosper@db:5432/prosper
+```
+
+---
+
+## Schemas 
+
+![Database Schema](images/db.png)
+*DB schema*
+
+For the patient appointments:
+Slots are created on database initialization for a given daily range, with a fixed duration and a fixed period ahead. 
+
+Here it made sense to separate the appointments from slots, considering an appointment can take up multiple slots. In a real application this would fit the clinic's timetable as well as have a separated table to map appointment reason to a predefined duration so the voice agent can detect what the caller is booking and how many slots that requires. To simplify it now defaults to 1 slot.
+
+ `availability_slots.is_booked` is a denormalized boolean so `/list_availability_slots` is a single indexed query with no joins O(1) for fast availability checks.
+
+The partial unique index on `appointment_slots`: `UNIQUE(slot_id) WHERE active` prevents double-booking at the database level, even under race conditions.
+
+For the audit section:
+`call_sessions` logs all the calls and `tool_call_logs` stores the requests with arguments and responses for a given call. This way I can see what the LLM calls, what request is sent and what response the backend returns and then what input the tool handler gives to the LLM as well as the latency for the tool execution. The idea is to debug inefficient tools, find non AI friendly responses passed to the LLM or inconsistencies/errors.
+
+
+---
+
+
+## Tools and handlers
+
+The agent exposes 10 tools to the LLM to identify the caller, register patients, escalate in case of failure, check slots and make/cancel appointments. Each tool is a `FlowsFunctionSchema` wired to an async handler. Every handler is wrapped with `@flows_audited` so the audit system records the LLM arguments, the EHR request/response, the handler's result back to the LLM, and the latency.
+
+Each handler does three things:
+
+1. Validate inputs against flow state, for example `submit_booking_request` checks that the requested time was actually returned by a prior `check_date_slots` call or  `submit_cancellation` checks that the chosen `appointment_id` was in the list loaded by `list_appointments`. This prevents the LLM from hallucinating tool arguments.
+
+2. Call the EHR via `ehr.py`. Errors are caught and translated into AI friendly messages so the conversation flow can continue.
+
+3. Return a result tuple: `(data_dict, next_node)`. The first element is the structured result fed back to the LLM (success/failure, details). The second element is the next `NodeConfig` to transition to. This is how the conversation graph advances deterministically: the handler, not the LLM, decides where to go next.
+
+Handlers read and write keys like `patient_id`, `confirmed_date`, `booking_dedup_key`. Because state lives outside the LLM context, the LLM cannot hallucinate a transition, it can only invoke tools whose handlers enforce the rules.
+
+I also compute and save a session-scoped dedup key (`session_id + patient_id + date + start + end`) on `fm.state` and check it before making a mutating EHR call. If the key matches a prior call, the handler returns the cached result without touching the database. This prevents the LLM from accidentally booking the same appointment twice if it re-invokes the tool. 
+
+
+
+
+## Conversation Flow
 
 ```mermaid
 flowchart TD
-    A["collect_identity\n(greet + submit_identity)"] -->|found| B["collect_intent\n(submit_intent)"]
-    A -->|not found| C["no_match\n(retry_or_register)"]
-    C -->|retry| A
-    C -->|register| D["collect_registration\n(submit_registration)"]
-    C -->|escalate| E["escalate\n(save_callback_phone)"]
-    D -->|success| B
-    D -->|fail| E
-    B -->|book| F["collect_booking_request\n(check_date_slots + submit_booking_request)"]
-    B -->|cancel| G["cancellation_flow\n(list_appointments_tool + submit_cancellation)"]
-    F -->|valid range| H["confirm_booking\n(confirm_booking)"]
-    F -->|invalid / no slots| F
-    H -->|confirmed=True| I["book\n(server-side: _perform_booking)"]
-    H -->|confirmed=False + correction=datetime| F
-    H -->|confirmed=False + correction=patient| A
-    I -->|success| J["wrap_up\n(end_conversation)"]
-    I -->|fail| E
-    G -->|appointment selected| K["cancel\n(server-side: _perform_cancellation)"]
-    K -->|success| J
-    K -->|fail| E
-    E --> J
+    Start([Caller connects]) --> Identity[collect_identity]
+
+    Identity -->|Patient found| Intent[collect_intent]
+    Identity -->|Not found| NoMatch[no_match]
+    Identity -->|New patient| Registration[collect_registration]
+
+    NoMatch -->|Retry| Identity
+    NoMatch -->|Register| Registration
+    NoMatch -->|Escalate| Escalate[escalate]
+
+    Registration --> Intent
+
+    Intent -->|Book| Booking[collect_booking_request]
+    Intent -->|Cancel| Cancel[cancellation_flow]
+
+    Booking -->|check_date_slots| Booking
+    Booking -->|submit_booking_request| Confirm[confirm_booking]
+    Confirm -->|Yes| BookingAction[_perform_booking]
+    Confirm -->|No / correction| Booking
+    BookingAction --> WrapUp[wrap_up]
+
+    Cancel -->|list_appointments_tool| Cancel
+    Cancel -->|submit_cancellation| CancelAction[_perform_cancellation]
+    CancelAction --> WrapUp
+
+    BookingAction -->|Fail| Escalate
+    CancelAction -->|Fail| Escalate
+    Registration -->|Fail| Escalate
+
+    Escalate -->|save_callback_phone| WrapUp
+    WrapUp --> End([End call])
 ```
 
-**Key design principle:** The two destructive EHR operations — `create_appointment` and `cancel_appointment` — are **not exposed as LLM tools anywhere in the graph**. They are pure Python helpers (`_perform_booking`, `_perform_cancellation`) called server-side only after the patient has explicitly confirmed via the `confirm_booking` or `submit_cancellation` handlers. The LLM cannot invoke them directly.
+## FlowManager vs Monolithic Prompt
 
-### 2.4 Database Schema
+As I was adding more and more content, restrictions and checks to the provided system prompt to modify the conversation flow as the challenge statement requires, I was concerned about the LLM hallucinating and not making the necessary checks before making the tool calls or not properly following the desired flow after many conversations turns / drifting. 
 
-```mermaid
-erDiagram
-    PATIENTS {
-        uuid id PK
-        string first_name
-        string last_name
-        date date_of_birth
-        string phone
-        string email
-        datetime created_at
-    }
+I was already handling the state in a dictionary so the LLM could not hallucinate the tool arguments but I came across this `FlowManager` module to define more rigid conversation.
 
-    AVAILABILITY_SLOTS {
-        uuid id PK
-        date date
-        time start_time
-        time end_time
-        boolean is_booked
-    }
+It seemed suitable for such a sensitive use case and rigid conversation flow to enforce it a set of states for the sake of reliability. 
 
-    APPOINTMENTS {
-        uuid id PK
-        uuid patient_id FK
-        string status
-        datetime created_at
-        datetime cancelled_at
-    }
+Prompts per node are tiny and the system prompt is only attached once at the root node. Token usage is similar and we reduce the LLM context by scoping node prompts and available tools per state.
 
-    APPOINTMENT_SLOTS {
-        uuid appointment_id PK,FK
-        uuid slot_id PK,FK
-        boolean active
-    }
+**Trade-off** 
+Because each node transition is driven by a tool-call result, advancing the conversation graph costs an extra LLM round-trip compared to a single monolithic prompt that could answer and act in one single turn. I consider the cost of a skipped confirmation or a hallucinated transition outweighs the added per-turn latency.
 
-    CALL_SESSIONS {
-        uuid id PK
-        uuid patient_id
-        string patient_name
-        string status
-        json transcript
-        datetime started_at
-        datetime ended_at
-    }
-
-    TOOL_CALL_LOGS {
-        uuid id PK
-        uuid session_id FK
-        uuid patient_id
-        string tool_name
-        json arguments
-        json result
-        boolean success
-        int duration_ms
-        datetime created_at
-    }
-
-    PATIENTS ||--o{ APPOINTMENTS : "has"
-    APPOINTMENTS ||--o{ APPOINTMENT_SLOTS : "composed_of"
-    APPOINTMENT_SLOTS ||--|| AVAILABILITY_SLOTS : "references"
-    CALL_SESSIONS ||--o{ TOOL_CALL_LOGS : "has"
-```
+The impact could be masked with a short filler while the tool call resolves, and reduced by keeping per-node prompts and tool sets small so each round-trip carries minimal context. Overall it's also adding more code complexity and a rigit conversational flow, which in this situation, I consider to be appropiate.
 
 ---
 
-## 3. Key Design Decisions & Trade-offs
+## Model selection
+Different models have different time-to-first-token and generation speed, so the model is a direct agent on the system latency and can easily be the bottleneck despide the tools running in under 50ms. The tradeoff against picking the fastest model everywhere is token pricing
 
-### 3.1 Flow Manager vs. Monolithic Prompt
-
-**Decision:** I used `pipecat_flows.FlowManager` with a 10-node graph instead of a single massive system prompt with 6 registered tools.
-
-**Why:** A monolithic prompt gives the LLM access to all tools at once. In a healthcare setting, this is risky — the model could theoretically call `cancel_appointment` immediately after identification, before the patient has even stated their intent. With Flows, each node exposes only the functions relevant to that step:
-- `collect_identity` only has `submit_identity`
-- `confirm_booking` only has `confirm_booking`
-- The destructive operations (`_perform_booking`, `_perform_cancellation`) are not functions at all — they are Python helpers unreachable from the LLM
-
-**Trade-off:** More code. A monolithic prompt is ~100 lines; the node graph is ~870 lines across `agent/nodes.py`. But the gain in safety and debuggability is worth it — each node is a self-contained unit with a single responsibility.
-
-### 3.2 Security: Three-Layer Defense for Destructive Operations
-
-**Decision:** `create_appointment` and `cancel_appointment` are protected by three independent layers.
-
-**Layer 1 — Not an LLM tool:** The EHR endpoints are never in any node's `functions` list. The LLM's function schema never includes them.
-
-**Layer 2 — State write only on confirmation:** The `confirmed_patient_id`, `confirmed_date`, `confirmed_start_time`, `confirmed_end_time`, and `confirmed_appointment_id` fields are written **only** inside the confirmation handlers (`handle_confirm_booking`, `handle_submit_cancellation`) when the patient explicitly says yes.
-
-**Layer 3 — Handler asserts before EHR write:** `_perform_booking` and `_perform_cancellation` verify all confirmed state fields are present before calling the EHR API. If any are missing, they log an invariant violation and escalate to a human.
-
-**Trade-off:** More complex state management. The `FlowManager.state` dict carries more fields. But in healthcare, a double-booking or accidental cancellation is worse than a little extra state tracking.
-
-### 3.3 Database: Denormalized `is_booked` on Slots
-
-**Decision:** `availability_slots` has a boolean `is_booked` column, even though the canonical booking state lives in the `appointment_slots` junction table.
-
-**Why:** Listing available slots is the hottest read path. Without `is_booked`, the query would need a `LEFT JOIN` + `NOT EXISTS` subquery. With it, the query is a simple `SELECT ... WHERE is_booked = false`.
-
-**Trade-off:** Two sources of truth. Mitigated by:
-- Updating `is_booked` in the same transaction as `appointment_slots` creation/cancellation.
-- Adding a DB-level partial unique index `UNIQUE(slot_id) WHERE active = true` on `appointment_slots`. Even if a race condition occurs, the index rejects the second insert.
-
-**Future:** If the clinic needs "soft holds" (mid-booking but not confirmed), `is_booked` would need to become a state machine. For now, binary is correct.
-
-### 3.4 Booking Model: Multi-Slot Appointments
-
-**Decision:** Appointments can span multiple contiguous slots (e.g., 09:00–10:00 uses two 30-minute slots).
-
-**Why:** Real clinics have visits of varying duration. The agent asks "How long do you need?" and books the appropriate number of slots.
-
-**Trade-off:** More complex validation. The API checks that:
-1. The requested range exactly tiles contiguous slots (no gaps, no partial overlap).
-2. All slots are unbooked.
-3. The start time is not in the past.
-
-By enforcing grid alignment, the API fails fast with a clear message rather than letting the LLM hallucinate times like 09:15.
-
-### 3.5 Session Security: Identity Locking
-
-**Decision:** Once the bot lists a patient's appointments or creates/cancels one, the session becomes `locked`. If the caller then tries to re-identify with a different name, the bot refuses.
-
-**Why:** Healthcare is high-stakes. A caller should not be able to say "Wait, actually I'm John Smith" after already seeing Jane Doe's appointments. This is a lightweight HIPAA-aligned guard.
-
-**Trade-off:** It prevents legitimate corrections. Mitigated by making the lock trigger only after **sensitive** data access (listing appointments), not after simple identification.
-
-### 3.6 Appointment Cancellation: Client-Side ID Validation
-
-**Decision:** The bot maintains an `appt_ids` set in `FlowManager.state`. `submit_cancellation` rejects any `appointment_id` not in that set, even if the patient technically owns it in the DB.
-
-**Why:** The prompt tells the LLM *"Never ask the caller for an appointment ID — always identify by date and time."* The caller never sees UUIDs. The only way the LLM can obtain an `appointment_id` is by calling `list_appointments_tool` first, which populates `appt_ids`. This prevents the LLM from hallucinating or fabricating an ID.
-
-**Trade-off:** If a new appointment is created by a different channel mid-call, the bot won't know about it. This is acceptable because the bot's world view is scoped to the conversation.
-
-### 3.7 Audit: Fail-Safe, Not Fail-Closed
-
-**Decision:** Every tool call is wrapped by `flows_audited(...)`, which logs the LLM arguments, the HTTP request/response, and the result to the EHR API. Audit failures are swallowed with `try/except` and run as fire-and-forget background tasks — they never block the conversation.
-
-**Why:** An audit system outage should not drop a patient call. The audit is for compliance and debugging, not for business logic.
-
-**Trade-off:** We might lose audit data during an outage. Mitigated by using `loguru` to log exceptions, so they still appear in application logs even if the DB write fails.
-
-### 3.8 LLM Fallback: OpenAI → Anthropic
-
-**Decision:** The pipeline uses `LLMSwitcher` with OpenAI as primary and Anthropic as fallback. An observer watches for `ErrorFrame` from the primary LLM and triggers a manual switch + `LLMRunFrame` retry.
-
-**Why:** Voice calls are real-time. If OpenAI's API is rate-limited or down, the call should not die. The fallback is a different provider, reducing correlated failure risk.
-
-**Trade-off:** The fallback LLM may not have the same tool definitions or may behave differently. Mitigated by registering tools on the `LLMSwitcher`, which forwards registration to **both** LLMs. The fallback is a fast, cheap model sufficient for graceful degradation.
-
-**Guard:** The `_switched` flag ensures only one fallback per call. Without it, a persistent error could loop between primary and fallback indefinitely.
-
-### 3.9 Dashboard: Polling + SSE Hybrid
-
-**Decision:** The dashboard polls `/dashboard` every 3 seconds **and** subscribes to `/events` (SSE) for instant updates.
-
-**Why:** SSE alone is elegant but fragile — proxy timeouts, connection drops, or mobile browsers can kill it. Polling is a robust backstop. The SSE `broadcast()` fires on every mutating DB operation, so the dashboard feels live.
-
-**Trade-off:** Slightly more server load. For a clinic with 5 staff members, this is negligible.
-
-### 3.10 Error Handling: Friendly vs. Precise
-
-**Decision:** The bot translates HTTP errors into patient-friendly voice messages. For example, a 409 "Slot already booked" becomes "I'm sorry, that slot was just taken. Would you like me to check the next available time?"
-
-**Why:** The LLM is the voice of the clinic. Exposing raw HTTP status codes or stack traces would be unprofessional and confusing.
-
-**Implementation:** The `_friendly_error` helper maps 4xx errors to a generic "invalid request" message and 5xx errors to "temporarily unavailable." The global persona prompt instructs: *"If a tool returns an error, apologize briefly and offer to try again or suggest calling the front desk."*
 
 ---
 
-## 4. Conversation Flow
+## Reliability
 
-The Flow Manager enforces a strict protocol through node transitions:
+I added a simple middleware on the backend that simply checks for the `X-API-Key` header of the requests to match with the local key. More complex approaches (JWT) can be applied but I assumed the focus was not on the CRM but the agent and conversation flow.
 
-```mermaid
-sequenceDiagram
-    participant Caller
-    participant Bot as Flow Manager Node Graph
-    participant EHR as EHR API
+I also came across `LLMSwitcher` to register the tools for more than one LLM provider and defined a custom `Switch Strategy` to change the provider seamlessly in case an error occurs or one provider doesn't respond. Can also be added to the TTS part of the pipeline. Configured Anthropic Claude as the fallback provider; the switcher activates on `ErrorFrame` from the primary.
 
-    Caller->>Bot: "Hi, I'd like to book an appointment"
-    Bot->>Bot: collect_identity node
-    Bot->>Caller: "Are you a new or returning patient?"
-    Caller->>Bot: "Returning"
-    Bot->>Caller: "What's your name and date of birth?"
-    Caller->>Bot: "Jane Doe, March 15 1985"
-    Bot->>Bot: submit_identity tool → find_patient
-    Bot->>EHR: GET /find_patient
-    EHR-->>Bot: Patient found
-    Bot->>Bot: collect_intent node
-    Bot->>Caller: "Welcome Jane. Book or cancel?"
-    Caller->>Bot: "Book"
-    Bot->>Bot: collect_booking_request node
-    Bot->>Caller: "What day?"
-    Caller->>Bot: "Tomorrow at 9 AM"
-    Bot->>EHR: GET /list_availability_slots
-    EHR-->>Bot: Slots available
-    Bot->>Bot: submit_booking_request tool
-    Bot->>Bot: confirm_booking node
-    Bot->>Caller: "So that's Jane Doe, Monday June 9 at 9 AM — is that right?"
-    Caller->>Bot: "Yes"
-    Bot->>Bot: confirm_booking tool → _perform_booking
-    Bot->>EHR: POST /create_appointment
-    EHR-->>Bot: Appointment created
-    Bot->>Bot: wrap_up node
-    Bot->>Caller: "Done — you're booked for Monday at 9 AM. Goodbye!"
-    Bot->>Bot: end_conversation
-```
+The EHR client module (`ehr.py`) catches `httpx.RequestError` and returns a friendly, caller-safe message so the agent doesn't slip raw stack traces to the user. 
 
-**Key constraints baked into the node graph:**
-- **Confirmation gates:** The bot must get a clear "yes" before booking. This prevents misheard names or times from creating phantom appointments.
-- **Weekend guard:** If the caller asks for a Saturday or Sunday, the bot redirects to the next Monday.
-- **No UUIDs aloud:** The prompt explicitly forbids reading IDs. All appointment selection is by natural date/time.
-- **Short responses:** One or two sentences max, no filler phrases. This is a voice call, not a chatbot.
+Also, every flow handler routes to an `escalate` node on unrecoverable failure (registration failed, booking failed, patient not found after retries). Escalation captures a callback phone number. This could be saved in a human-call required table for example...
+
+### Guards
+- `submit_booking_request` Checks slot edges so if the patient/LLM picks a time that doesn't align, it fails before touching the DB.
+- `_perform_booking` and `_perform_cancellation` check that all required state fields exist before acting.
+- The booking node instructs the LLM that the clinic is Monday–Friday only. If the patient asks for Saturday, the LLM redirects to the next Monday.
+- Every node prompt explicitly forbids reading IDs aloud.
+- Every tool schema sets `cancel_on_interruption=False`. This prevents a mutating tool (booking, cancellation) from being abandoned mid-flight if the user interrupts while the handler is still executing.
 
 ---
 
-## 5. Areas for Improvement
+## Evaluation
 
-### 5.1 Latency: Reducing Time-to-First-Word
+### Log and audit
 
-**Current state:** The bot takes ~20 seconds on first boot (model download). Per-turn latency is dominated by STT, LLM inference, and TTS.
+![Audit Log](images/Audit.png)
 
-**Opportunities:**
-- **Streaming function calls:** Currently, the bot waits for the full LLM response before speaking. Pipecat supports streaming TTS, but function calls are synchronous. Streaming the LLM's reasoning while the user is still speaking could shave perceptible latency.
-- **Local LLM:** For simple intents ("I want to cancel"), a local 7B model could decide without a network round-trip. Complex cases (multi-slot booking) would still hit OpenAI. A hybrid router would trade accuracy for speed on the easy path.
-- **Pre-fetching slots:** The bot could pre-fetch tomorrow's availability slots in the background while the caller is still giving their name, reducing the perceived latency of the "what times do you have?" step.
+- `AuditLogger` posts to `/audit/session` on start/finish and `/audit/tool_call` after each handler.
+- Posts are fire-and-forget so logging never blocks the voice pipeline.
+- The dashboard streams updates via SSE (`/events`) so for live call state.
 
-### 5.2 Reliability: Surviving External Failures
+### Simulation Framework
 
-**Current state:** We have LLM fallback and friendly error messages. But the system is still vulnerable to:
-- **EHR API outage:** The bot apologizes and suggests calling the front desk. This is graceful degradation, but not recovery.
-- **Database outage:** The API returns 500; the bot catches it. But no retry or queueing exists.
-- **STT/TTS outage:** If ElevenLabs is down, the call is dead. We have no fallback STT/TTS provider configured.
+![Simulation](images/Simulation.png)
+*LLM patient improvises a conversation and the result is evaluated by DB assertions and an LLM judge.*
 
-**Opportunities:**
-- **Circuit breaker:** If the EHR API fails 3 times in 30 seconds, the bot should enter a "read-only mode" where it can answer questions but not book/cancel. This prevents cascading failures.
-- **Async job queue:** For appointment creation, we could enqueue the request in Redis/RabbitMQ and return a "pending" confirmation. The bot would say "I'm processing your booking — you'll get a text confirmation in a moment." This decouples the voice pipeline from DB write latency.
-- **Fallback TTS:** Configure a local TTS (e.g., Coqui TTS, Piper) as a last resort. The voice quality would drop, but the call would continue.
-- **Health checks + auto-restart:** The Docker Compose setup should include `healthcheck` blocks and `restart: unless-stopped` for all services.
+How it works:
+1. **Scenario definition** (`api/core/scenarios.py`) — persona, goal, expected DB state, and a rubric.
+2. **LLM patient** — an OpenAI LLM plays the patient, improvising replies based on the scenario persona and the transcript so far.
+3. **Text-mode bot** — `TextTransport` replaces WebRTC + STT + TTS and injects the LLM patient responses as input. The same `bot.py` entrypoint runs unchanged.
+4. **Evaluation**:
+   - **DB assertions**: after the conversation, the engine queries PostgreSQL to verify the exact expected patient and appointment state.
+   - **LLM judge**: a second LLM pass scores the conversation transcript against the rubric ("bot confirmed name and DOB before lookup", "never exposed UUIDs", ...) This produces an output and a pass/fail category.
 
-### 5.3 Evaluation: Automated Testing & Simulation
+Scenarios cover:
+- New patient books
+- Existing patient cancels
+- Misspelled name -> retry
+- Weekend redirect
 
-**Current state:** No automated test suite for the conversation flow. Validation is manual: open the browser, click Connect, talk to the bot.
+Ideally, simulations should run in batch and in the background to test many different scenarios. This still risks the patient LLM or the Judge hallucinating and yielding both false positive and false negatives. Rigid DB checks cannot be enforced if the conversation tone or other qualitative aspects are being checked. Waiting for LLM to respond makes the testing slow compared to deterministic backend tests for example.
 
-**Opportunities:**
 
-#### A. Unit Tests for Node Handlers
-We can test each `handle_*` function in isolation with a mocked `httpx.AsyncClient` and a fake `FlowManager`. This is low-hanging fruit and would catch regressions in parameter mapping, state logic, and error handling.
+### Random evaluation ideas
 
-#### B. LLM-as-Judge for Conversation Quality
-Use a second LLM with a strict evaluation prompt to grade conversation transcripts on:
-- Did the bot ask for confirmation before identifying?
-- Did it refuse to book without authentication?
-- Did it read back the correct date/time?
-- Did it hallucinate a UUID?
+**"Supervised learning" from simulations**
+- Record every successful real call transcript + tool call trace as a "golden path".
+- When a new bot version is deployed or being tested, simulate the same scenarios and diff the tool call sequences and obtain metrics. Any failure or divergence from the golden tool trace is an error.
 
-This is a form of **synthetic evaluation** that can run in CI without human testers.
-
-#### C. Simulation Framework: pytest + Pipecat test harness
-Pipecat can be driven with programmatic frame injection. We could build a harness that:
-1. Injects `TranscriptionFrame` with fake STT text (e.g., "My name is John Smith, born March 15th 1985").
-2. Captures the resulting `TTSFrame` or `FunctionCallFrame`.
-3. Asserts that the expected tool was called with the expected arguments.
-4. Injects the tool result and asserts the next LLM response contains the expected text.
-
-This would let us run 100 simulated calls in CI and catch regressions like "the LLM stopped asking for confirmation" or "it books appointments without checking availability first."
-
-#### D. Shadow Mode / A/B Testing
-In production, run the new bot version in "shadow mode": it receives the same audio stream but does not speak or act. Its tool calls and responses are compared against the production version. Divergences are flagged for human review. This de-risks deployments.
-
-#### E. Red-Team / Adversarial Testing
-Have an LLM act as a malicious caller and try to:
-- Cancel someone else's appointment.
-- Extract another patient's data.
-- Book a slot in the past.
-- Crash the bot with unexpected input (e.g., SQL injection via voice).
-
-This can be automated and run nightly.
+**Adversarial LLM**
+- Build a LLM that calls the voice bot with edge-case inputs: wrong dates, ambiguous intents, social-engineering prompts, interruption mid-flow...
+- The adversary's goal is to cause a tool error, leaks, or state violation.
+- Could be added as scenarios for the built simulation framework.
 
 ---
 
-## 6. Files & Structure
+## Approach
 
-```
-prosper-challenge/
-├── agent/
-│   ├── bot.py              # Pipecat pipeline, FlowManager setup, LLM fallback
-│   ├── nodes.py            # Flow node graph: 10 nodes, security layers, handlers
-│   ├── ehr.py              # httpx client + _friendly_error + ehr_get/ehr_post
-│   ├── audit.py            # AuditLogger + flows_audited() wrapper
-│   └── Dockerfile          # Bot service image
-├── api/
-│   ├── main.py             # FastAPI app, lifespan, CORS, middleware
-│   ├── core/
-│   │   ├── auth.py         # API key middleware (X-API-Key)
-│   │   ├── database.py     # SQLModel async engine + session factory
-│   │   ├── seed.py         # Generates 60 days of 30-minute slots
-│   │   └── events.py       # SSE broadcast helper
-│   ├── models/
-│   │   ├── patient.py      # Patient table + case-insensitive unique index
-│   │   ├── slot.py         # AvailabilitySlot + denormalized is_booked
-│   │   ├── appointment.py  # Appointment table + status constraint
-│   │   ├── appointment_slot.py  # Junction table + double-booking guard
-│   │   └── audit.py        # CallSession + ToolCallLog
-│   ├── routers/
-│   │   ├── patients.py     # create_patient, find_patient
-│   │   ├── slots.py        # list_availability_slots
-│   │   ├── appointments.py  # create_appointment, cancel_appointment, list_appointments
-│   │   ├── dashboard.py    # /dashboard, /calendar
-│   │   ├── audit.py        # /audit/session, /audit/tool_call, /audit/sessions
-│   │   └── events.py       # SSE /events
-│   └── schemas/
-│       ├── patient.py
-│       ├── slot.py
-│       ├── appointment.py
-│       ├── dashboard.py
-│       └── audit.py
-├── frontend/               # Vite + React + Tailwind dashboard (read-only)
-├── docker-compose.yml      # Full stack: db, api, frontend, bot
-├── SOLUTION.md             # This file
-└── README.md               # Challenge instructions
-```
+### Initial plan
+
+Before writing code I sketched the following plan:
+
+1. **Run the template bot** and talk to it to understand the baseline behavior.
+2. **Read how the bot works** — the Pipecat pipeline, transports, STT/LLM/TTS services, and where tool calls and the system prompt plug in.
+3. **Define the database and schema** for patients, slots, and appointments.
+4. **Build the EHR backend** exposing the required endpoints.
+5. **Build a frontend** with a live feed (webhook/SSE) to watch DB changes in real time.
+6. **Secure sensitive data** behind an API key.
+7. **Add tools** that call my backend and wire them to the agent.
+8. **Rewrite the system prompt** to guide the agent through patient identification → registration → appointment scheduling/cancellation via prompt engineering.
+9. **Extra features** beyond the brief.
+
+My initial brainstorming on the key design decisions:
+
+- FastAPI backend with PostgreSQL.
+- Vite frontend with a simple SSE stream to display DB state in real time.
+- Fully dockerized.
+- `(name, DOB)` must be explicit tool arguments.
+- Validate every tool argument server-side.
+- `find_patient` returns a patient identifier used for follow-up tool calls.
+- The patient id in follow-up calls must come from server state, never be LLM-generated.
+- Log all tool calls.
+
+### How it actually went
+
+The real process followed the plan but grew iteratively:
+
+1. **Scaffold** — initial backend scaffold and a dummy frontend to have something end-to-end.
+2. **Tools + simple system prompt** — wired the required endpoints as tools and drove the flow with a single prompt.
+3. **Tool-call logger** — added the audit logging so I could see exactly what the LLM called, what was sent, and what came back.
+4. **Optimize schemas and endpoints** — tightened the DB schema (denormalized `is_booked`, partial unique index), validation, and responses.
+5. **Edge cases via the prompt** — as I handled more edge cases and flow constraints, the single system prompt kept growing and became harder to keep reliable.
+6. **Migrate to FlowManager** — moved the growing prompt into an explicit node graph to enforce the flow and scope tools/state per node.
+7. **Reliability** — added the fallback LLM provider and improved the architecture.
+8. **Simulation PoC** — built the text-mode simulation framework to test calls automatically with DB assertions and an LLM judge.
 
 ---
-
-## 7. How to Run
-
-```bash
-# Full stack (PostgreSQL + API + Frontend + Bot)
-docker compose up --build
-
-# Endpoints:
-#   http://localhost:8000/docs  — FastAPI OpenAPI UI
-#   http://localhost:5173       — Dashboard
-#   http://localhost:7860       — Bot (click Connect to talk)
-```
-
----
-
-## 8. Summary
-
-I built a production-grade voice agent for a healthcare clinic that:
-- **Identifies patients** by name and DOB, with confirmation gating and spelling retry logic.
-- **Registers new patients** atomically, rejecting duplicates at the DB level.
-- **Books multi-slot appointments** with atomic availability checks and DB-level double-booking guards.
-- **Cancels appointments** securely, with client-side ID validation to prevent hallucination.
-- **Uses a node-based conversation graph** (Pipecat Flows) instead of a monolithic prompt, giving precise control over each step and ensuring destructive operations can only happen after explicit patient confirmation.
-- **Protects destructive operations with three independent security layers:** not exposed as LLM tools, state written only on confirmation, server-side asserts before EHR writes.
-- **Audits everything** — every tool call, every HTTP exchange, every conversation transcript, shipped via fire-and-forget background tasks that never block the call.
-- **Falls back gracefully** — LLM provider failure, EHR downtime, or invalid input all produce friendly voice responses rather than crashes.
-- **Provides real-time visibility** — a dashboard with live SSE updates so clinic staff can see the schedule as it changes.
-
-The design prioritizes **safety over convenience** (three-layer security, confirmation gates, DB-level constraints) and **observability over opacity** (full audit trail, structured logs, node-level debugging). The trade-offs are documented above, along with concrete next steps for latency, reliability, and evaluation.
