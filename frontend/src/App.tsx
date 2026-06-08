@@ -4,12 +4,14 @@ import StatsBar from './components/StatsBar'
 import PatientsTable from './components/PatientsTable'
 import WeekCalendar from './components/WeekCalendar'
 import AuditLog from './components/AuditLog'
+import SimulationTab from './components/SimulationTab'
 import Tabs from './components/Tabs'
 import type { DashboardData, CalendarSlot } from './types'
 import { mondayOf, toISODate, addDays } from './utils'
 import { API_URL, headers } from './api'
 
-type Tab = 'appointments' | 'patients' | 'audit'
+
+type Tab = 'appointments' | 'patients' | 'audit' | 'simulation'
 
 function initialWeek(): Date {
   const today = new Date()
@@ -82,6 +84,7 @@ export default function App() {
               { id: 'appointments', label: 'Appointments' },
               { id: 'patients', label: 'Patients', count: data?.total_patients },
               { id: 'audit', label: 'Audit Log' },
+              { id: 'simulation', label: 'Simulation' },
             ]}
             active={tab}
             onChange={id => setTab(id as Tab)}
@@ -97,8 +100,10 @@ export default function App() {
             />
           ) : tab === 'patients' ? (
             <PatientsTable patients={data?.recent_patients ?? []} />
-          ) : (
+          ) : tab === 'audit' ? (
             <AuditLog />
+          ) : (
+            <SimulationTab />
           )}
         </div>
       </main>

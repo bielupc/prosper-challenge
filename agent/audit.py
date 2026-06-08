@@ -9,19 +9,6 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 from loguru import logger
 
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _spawn(coro: Awaitable[None]) -> None:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-
-async def flush_pending() -> None:
-    if _background_tasks:
-        await asyncio.gather(*list(_background_tasks), return_exceptions=True)
-
 _http_exchange: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "http_exchange", default=None
 )
@@ -69,6 +56,16 @@ class AuditLogger:
         self._state = session_state
         self._get_transcript = get_transcript
         self._finished = False
+        self._tasks: set[asyncio.Task] = set()
+
+    def spawn(self, coro: Awaitable[None]) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def flush_pending(self) -> None:
+        if self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
     async def _post(self, path: str, body: dict) -> None:
         try:
@@ -79,22 +76,11 @@ class AuditLogger:
     async def start(self) -> None:
         await self._post("/audit/session", {"session_id": self._session_id})
 
-    async def sync_transcript(self) -> None:
-        await self._post(
-            "/audit/session",
-            {
-                "session_id": self._session_id,
-                "patient_id": self._state.get("patient_id"),
-                "patient_name": self._state.get("patient_name"),
-                "transcript": self._get_transcript(),
-            },
-        )
-
     async def finish(self) -> None:
         if self._finished:
             return
         self._finished = True
-        await flush_pending()
+        await self.flush_pending()
         await self._post(
             "/audit/session",
             {
@@ -149,6 +135,11 @@ def flows_audited(tool_name: str, handler: Callable) -> Callable:
         try:
             result = await handler(args, fm)
             return result
+        except Exception as exc:
+            ex = _http_exchange.get()
+            if ex is not None and "error" not in ex:
+                ex["error"] = repr(exc)
+            raise
         finally:
             http = _http_exchange.get()
             _http_exchange.reset(token)
@@ -169,6 +160,6 @@ def flows_audited(tool_name: str, handler: Callable) -> Callable:
                     except Exception:
                         logger.exception("Audit logging for {} failed", tool_name)
 
-                _spawn(_emit())
+                audit.spawn(_emit())
 
     return wrapped

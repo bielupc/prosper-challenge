@@ -78,7 +78,7 @@ async def create_appointment(
         await session.commit()
     except IntegrityError:
         await session.rollback()
-        raise HTTPException(status_code=409, detail="Slot already booked")
+        raise HTTPException(status_code=409, detail="Slot already booked") from None
     await session.refresh(appointment)
     await broadcast()
     return _appointment_response(appointment, slots)
@@ -100,7 +100,7 @@ async def cancel_appointment(
             .join(AvailabilitySlot, AvailabilitySlot.id == AppointmentSlot.slot_id)
             .where(
                 AppointmentSlot.appointment_id == appointment.id,
-                AppointmentSlot.active == True, 
+                AppointmentSlot.active == True,
             )
             .order_by(AvailabilitySlot.start_time)
         )
@@ -135,7 +135,7 @@ async def list_appointments(patient_id: uuid.UUID, session: AsyncSession = Depen
             .where(
                 Appointment.patient_id == patient_id,
                 Appointment.status == "scheduled",
-                AppointmentSlot.active == True, 
+                AppointmentSlot.active == True,
             )
             .order_by(AvailabilitySlot.date, AvailabilitySlot.start_time)
         )

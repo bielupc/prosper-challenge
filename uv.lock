@@ -1982,6 +1982,7 @@ dependencies = [
     { name = "pipecat-ai", extra = ["anthropic", "daily", "elevenlabs", "local-smart-turn-v3", "openai", "runner", "silero", "webrtc"] },
     { name = "pipecat-ai-cli" },
     { name = "pipecat-ai-flows" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -1995,6 +1996,7 @@ requires-dist = [
     { name = "pipecat-ai", extras = ["webrtc", "daily", "silero", "elevenlabs", "openai", "anthropic", "local-smart-turn-v3", "runner"] },
     { name = "pipecat-ai-cli" },
     { name = "pipecat-ai-flows", specifier = ">=0.0.23" },
+    { name = "websockets", specifier = ">=12.0" },
 ]
 
 [package.metadata.requires-dev]

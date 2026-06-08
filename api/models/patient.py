@@ -27,4 +27,5 @@ class Patient(SQLModel, table=True):
     date_of_birth: date
     phone: Optional[str] = Field(default=None, max_length=20)
     email: Optional[str] = Field(default=None, max_length=255)
+    source: Optional[str] = Field(default=None, max_length=50)
     created_at: datetime = Field(default_factory=_utcnow, sa_column=_tz_column())
