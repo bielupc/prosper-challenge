@@ -18,4 +18,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY agent/ ./agent/
 
-CMD ["uv", "run", "agent/bot.py", "--host", "0.0.0.0"]
+# Run the WebRTC voice bot (7860) in the background and the WebSocket text server
+# (7861, used by simulations) in the foreground so the container stays alive.
+CMD ["sh", "-c", "uv run agent/bot.py --host 0.0.0.0 & exec uv run agent/ws_server.py"]

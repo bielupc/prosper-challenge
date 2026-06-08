@@ -39,6 +39,7 @@ services:
     env_file: .env
     ports:
       - "7860:7860"
+      - "7861:7861"
     networks:
       - prosper-net
 

@@ -66,3 +66,37 @@ export interface CallSessionDetail {
   ended_at: string | null
   tool_calls: ToolCallLog[]
 }
+
+// Simulation types
+export interface ScenarioSummary {
+  id: string
+  name: string
+  description: string
+}
+
+export interface SimTurn {
+  role: string
+  text: string
+  timestamp: string
+}
+
+export interface SimToolCall {
+  name: string
+  arguments: Record<string, unknown> | null
+  result: unknown
+  timestamp: string
+}
+
+export interface SimulationResult {
+  id: string
+  scenario_id: string
+  status: string
+  transcript: SimTurn[]
+  tool_calls: SimToolCall[]
+  db_passed: boolean
+  judge_passed: boolean
+  passed: boolean
+  reasoning: string
+  started_at: string
+  completed_at: string | null
+}

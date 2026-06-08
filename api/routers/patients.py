@@ -21,7 +21,7 @@ async def create_patient(body: CreatePatientRequest, session: AsyncSession = Dep
         await session.commit()
     except IntegrityError:
         await session.rollback()
-        raise HTTPException(status_code=409, detail="Patient already registered")
+        raise HTTPException(status_code=409, detail="Patient already registered") from None
     await session.refresh(patient)
     await broadcast()
     return patient

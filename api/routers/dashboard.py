@@ -26,7 +26,7 @@ async def dashboard(session: AsyncSession = Depends(get_session)):
             .where(
                 AvailabilitySlot.date == today,
                 Appointment.status == "scheduled",
-                AppointmentSlot.active == True, 
+                AppointmentSlot.active == True,
             )
         )
     ).scalar_one()
@@ -72,7 +72,7 @@ async def calendar(start: date, session: AsyncSession = Depends(get_session)):
                 .outerjoin(
                     AppointmentSlot,
                     (AppointmentSlot.slot_id == AvailabilitySlot.id)
-                    & (AppointmentSlot.active == True), 
+                    & (AppointmentSlot.active == True),
                 )
                 .outerjoin(
                     Appointment,

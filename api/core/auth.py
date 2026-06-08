@@ -4,11 +4,13 @@ import os
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-_PUBLIC_PATHS = {"/docs", "/openapi.json", "/redoc"}
+_PUBLIC_PATHS = {"/docs", "/openapi.json", "/redoc", "/health"}
+_PUBLIC_PREFIXES = ("/simulate/stream/",)
 
 
 async def api_key_middleware(request: Request, call_next):
-    if request.url.path in _PUBLIC_PATHS:
+    path = request.url.path
+    if path in _PUBLIC_PATHS or path.startswith(_PUBLIC_PREFIXES):
         return await call_next(request)
     expected = os.environ.get("EHR_API_KEY")
     if not expected:

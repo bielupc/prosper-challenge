@@ -4,13 +4,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import models  # noqa: F401 — registers SQLModel metadata
+import models
 from core.auth import api_key_middleware
 from core.database import create_db
 from core.seed import seed_slots
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import appointments, audit, dashboard, events, patients, slots
+from routers import appointments, audit, dashboard, events, patients, simulation, slots
 
 
 @asynccontextmanager
@@ -43,3 +43,4 @@ app.include_router(appointments.router)
 app.include_router(dashboard.router)
 app.include_router(audit.router)
 app.include_router(events.router)
+app.include_router(simulation.router)
