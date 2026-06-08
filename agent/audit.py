@@ -1,12 +1,6 @@
-#
-# Audit logging for the voice agent's tool calls and conversation.
-#
-# Tool handlers are wrapped by `audited(...)`, which records the LLM arguments,
-# the EHR API exchange (captured via the `_http_exchange` context var that
-# `record_http` writes into), and the result handed back to the LLM. Everything
-# is shipped to the EHR API over the bot's existing authenticated httpx client.
-# Audit failures are swallowed — they must never break a live call.
-#
+""" Audit logging for the voice agent's tool calls and conversation."""
+
+import asyncio
 import contextvars
 import json
 import time
@@ -15,8 +9,19 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 from loguru import logger
 
-# Holds the in-flight tool call's HTTP exchange. Set by `audited`, written by
-# `record_http` (called from inside _ehr_get/_ehr_post), read back when logging.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro: Awaitable[None]) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def flush_pending() -> None:
+    if _background_tasks:
+        await asyncio.gather(*list(_background_tasks), return_exceptions=True)
+
 _http_exchange: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "http_exchange", default=None
 )
@@ -45,7 +50,6 @@ def record_http(
 
 
 def _safe(obj: Any) -> Any:
-    """Coerce to JSON-serializable, tolerating uuids/dates/sets in tool payloads."""
     try:
         return json.loads(json.dumps(obj, default=str))
     except (TypeError, ValueError):
@@ -64,6 +68,7 @@ class AuditLogger:
         self._session_id = str(session_id)
         self._state = session_state
         self._get_transcript = get_transcript
+        self._finished = False
 
     async def _post(self, path: str, body: dict) -> None:
         try:
@@ -86,6 +91,10 @@ class AuditLogger:
         )
 
     async def finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        await flush_pending()
         await self._post(
             "/audit/session",
             {
@@ -108,8 +117,6 @@ class AuditLogger:
         http = http or {}
         status = http.get("response_status")
         error = http.get("error")
-        # Failure = an HTTP error reached us, or the request raised. Short-circuit
-        # handlers that never hit the API (no status, no error) count as success.
         success = error is None and (status is None or status < 400)
         await self._post(
             "/audit/tool_call",
@@ -132,42 +139,36 @@ class AuditLogger:
         )
 
 
-def audited(
-    audit: AuditLogger,
-    tool_name: str,
-    handler: Callable[[Any], Awaitable[None]],
-) -> Callable[[Any], Awaitable[None]]:
-    """Wrap a Pipecat tool handler so each invocation is persisted to the audit log."""
-
-    async def wrapped(params: Any) -> None:
+def flows_audited(tool_name: str, handler: Callable) -> Callable:
+    """Wrap a Pipecat Flows handler (args, fm) for audit logging."""
+    async def wrapped(args: Any, fm: Any):
+        audit: Optional[AuditLogger] = fm.state.get("audit")
         token = _http_exchange.set({})
         start = time.monotonic()
-        captured: dict = {}
-
-        original_cb = params.result_callback
-
-        async def capturing_cb(result, *a, **k):
-            captured["result"] = result
-            return await original_cb(result, *a, **k)
-
-        params.result_callback = capturing_cb
+        result = None
         try:
-            await handler(params)
+            result = await handler(args, fm)
+            return result
         finally:
-            params.result_callback = original_cb
             http = _http_exchange.get()
             _http_exchange.reset(token)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            try:
-                await audit.log_tool_call(
-                    tool_name=tool_name,
-                    arguments=getattr(params, "arguments", None),
-                    http=http,
-                    result=captured.get("result"),
-                    duration_ms=duration_ms,
-                )
-                await audit.sync_transcript()
-            except Exception:
-                logger.exception("Audit logging for {} failed", tool_name)
+            if audit:
+                # Fire-and-forget: audit POSTs must NOT block the handler's return.
+                duration_ms = int((time.monotonic() - start) * 1000)
+                result_snapshot = result[0] if isinstance(result, tuple) else result
+
+                async def _emit() -> None:
+                    try:
+                        await audit.log_tool_call(
+                            tool_name=tool_name,
+                            arguments=args,
+                            http=http,
+                            result=result_snapshot,
+                            duration_ms=duration_ms,
+                        )
+                    except Exception:
+                        logger.exception("Audit logging for {} failed", tool_name)
+
+                _spawn(_emit())
 
     return wrapped

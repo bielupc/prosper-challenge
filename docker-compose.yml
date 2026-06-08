@@ -32,7 +32,9 @@ services:
       - prosper-net
 
   bot:
-    build: .
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
     container_name: prosper-bot
     env_file: .env
     ports:

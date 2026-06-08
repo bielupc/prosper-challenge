@@ -16,6 +16,6 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev
 
-COPY bot.py audit.py ./
+COPY agent/ ./agent/
 
-CMD ["uv", "run", "bot.py", "--host", "0.0.0.0"]
+CMD ["uv", "run", "agent/bot.py", "--host", "0.0.0.0"]
